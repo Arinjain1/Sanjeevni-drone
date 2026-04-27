@@ -4,7 +4,7 @@ const http = require("http");
 const { Server } = require("socket.io");
 const bodyParser = require("body-parser");
 const cors = require("cors");
-const mysql = require("mysql2/promise");
+const { Pool } = require("pg"); // Replaced mysql2 with pg
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { v4: uuidv4 } = require("uuid");
@@ -19,20 +19,17 @@ app.use(bodyParser.json());
 // ---------- DB ----------
 let pool;
 (async () => {
-  pool = mysql.createPool({
-    host: process.env.MYSQL_HOST || "127.0.0.1",
-    port: process.env.MYSQL_PORT ? Number(process.env.MYSQL_PORT) : 3306,
-    user: process.env.MYSQL_USER || "root",
-    password: process.env.MYSQL_PASSWORD || "",
-    database: process.env.MYSQL_DATABASE || "realtime_tracker",
-    waitForConnections: true,
-    connectionLimit: 10
+  pool = new Pool({
+    // Get this connection string from Supabase: Project Settings -> Database -> Connection String (URI)
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false } // Required for Supabase
   });
+  
   try {
     await pool.query("SELECT 1");
-    console.log("MySQL connected");
+    console.log("Supabase (PostgreSQL) connected");
   } catch (e) {
-    console.error("MySQL connection failed:", e.message);
+    console.error("Supabase connection failed:", e.message);
   }
 })();
 
@@ -61,12 +58,14 @@ app.post("/api/auth/register", async (req, res) => {
       return res.status(400).json({ error: "code,name,email,password,lat,lng required" });
     }
     const hash = await bcrypt.hash(password, 10);
-    const [result] = await pool.execute(
+    
+    // Postgres uses RETURNING id to get the inserted row's ID
+    const { rows } = await pool.query(
       `INSERT INTO hospitals (code,name,address,contact_phone,lat,lng,email,password_hash)
-       VALUES (?,?,?,?,?,?,?,?)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
       [code, name, address || null, contact_phone || null, lat, lng, email, hash]
     );
-    return res.json({ ok: true, id: result.insertId });
+    return res.json({ ok: true, id: rows[0].id });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -77,8 +76,8 @@ app.post("/api/auth/login", async (req, res) => {
   if (!email || !password) return res.status(400).json({ error: "email and password required" });
 
   try {
-    const [rows] = await pool.execute(
-      `SELECT id, code, name, email, password_hash FROM hospitals WHERE email=? LIMIT 1`,
+    const { rows } = await pool.query(
+      `SELECT id, code, name, email, password_hash FROM hospitals WHERE email=$1 LIMIT 1`,
       [email]
     );
     if (!rows.length) return res.status(401).json({ error: "Invalid credentials" });
@@ -107,8 +106,8 @@ app.post("/api/drones", authRequired, async (req, res) => {
   
   try {
     const api_key = uuidv4();
-    await pool.execute(
-      `INSERT INTO drones (drone_id, hospital_id, model, status, api_key) VALUES (?,?,?,?,?)`,
+    await pool.query(
+      `INSERT INTO drones (drone_id, hospital_id, model, status, api_key) VALUES ($1,$2,$3,$4,$5)`,
       [drone_id, req.user.id, model || null, status, api_key]
     );
     // for quick resolve by tracking id
@@ -122,7 +121,8 @@ app.post("/api/drones", authRequired, async (req, res) => {
       hospital_id: req.user.id
     });
   } catch (err) {
-    if (err.code === 'ER_DUP_ENTRY') {
+    // 23505 is the Postgres error code for unique constraint violation
+    if (err.code === '23505') { 
       return res.status(400).json({ error: "Drone ID already exists" });
     }
     return res.status(500).json({ error: err.message });
@@ -131,9 +131,9 @@ app.post("/api/drones", authRequired, async (req, res) => {
 
 app.get("/api/drones", authRequired, async (req, res) => {
   try {
-    const [rows] = await pool.execute(
+    const { rows } = await pool.query(
       `SELECT id, drone_id, hospital_id, model, status, api_key, created_at
-       FROM drones WHERE hospital_id = ? ORDER BY created_at DESC`,
+       FROM drones WHERE hospital_id = $1 ORDER BY created_at DESC`,
       [req.user.id]
     );
     return res.json({ ok: true, drones: rows });
@@ -149,9 +149,9 @@ app.post("/api/requests", authRequired, async (req, res) => {
 
   const request_id = "REQ-" + uuidv4();
   try {
-    await pool.execute(
+    await pool.query(
       `INSERT INTO requests (request_id, requester_hospital_id, medicine, quantity, notes)
-       VALUES (?,?,?,?,?)`,
+       VALUES ($1,$2,$3,$4,$5)`,
       [request_id, req.user.id, medicine, quantity, notes || null]
     );
     const payload = {
@@ -174,7 +174,7 @@ app.post("/api/requests", authRequired, async (req, res) => {
 // Get all requests
 app.get("/api/requests", authRequired, async (req, res) => {
   try {
-    const [rows] = await pool.execute(`
+    const { rows } = await pool.query(`
       SELECT r.*, h.name as requester_hospital_name
       FROM requests r
       JOIN hospitals h ON r.requester_hospital_id = h.id
@@ -194,8 +194,8 @@ app.post("/api/requests/:requestId/accept", authRequired, async (req, res) => {
 
   try {
     // ensure apiKey belongs to accepting hospital (B)
-    const [drows] = await pool.execute(
-      `SELECT id, drone_id, hospital_id, api_key FROM drones WHERE api_key=? LIMIT 1`,
+    const { rows: drows } = await pool.query(
+      `SELECT id, drone_id, hospital_id, api_key FROM drones WHERE api_key=$1 LIMIT 1`,
       [apiKey.trim()]
     );
     if (!drows.length) return res.status(400).json({ error: "Invalid Drone API Key" });
@@ -203,10 +203,10 @@ app.post("/api/requests/:requestId/accept", authRequired, async (req, res) => {
     if (drone.hospital_id !== req.user.id) return res.status(403).json({ error: "You don't own this drone" });
 
     // set accepted & assigned
-    await pool.execute(
+    await pool.query(
       `UPDATE requests
-       SET status='assigned', accepted_by_hospital_id=?, accepted_at=NOW(), assigned_drone_id=?
-       WHERE request_id=?`,
+       SET status='assigned', accepted_by_hospital_id=$1, accepted_at=NOW(), assigned_drone_id=$2
+       WHERE request_id=$3`,
       [req.user.id, drone.id, requestId]
     );
 
@@ -234,7 +234,7 @@ app.get("/api/track/resolve/:trackingId", async (req, res) => {
   if (cached) return res.json({ ok: true, droneId: cached, trackingId });
 
   try {
-    const [rows] = await pool.execute(`SELECT drone_id FROM drones WHERE api_key=? LIMIT 1`, [trackingId]);
+    const { rows } = await pool.query(`SELECT drone_id FROM drones WHERE api_key=$1 LIMIT 1`, [trackingId]);
     if (!rows.length) return res.status(404).json({ error: "Tracking ID not found" });
     trackingMap[trackingId] = rows[0].drone_id;
     return res.json({ ok: true, droneId: rows[0].drone_id, trackingId });
@@ -251,18 +251,29 @@ app.post("/api/locations", async (req, res) => {
   }
 
   try {
-    const [drows] = await pool.execute(`SELECT drone_id FROM drones WHERE api_key=? LIMIT 1`, [apiKey.trim()]);
+    const { rows: drows } = await pool.query(`SELECT drone_id FROM drones WHERE api_key=$1 LIMIT 1`, [apiKey.trim()]);
     if (!drows.length) return res.status(400).json({ error: "Invalid apiKey" });
     const droneId = drows[0].drone_id;
 
-    await pool.execute(
+    await pool.query(
       `INSERT INTO locations (drone_id, latitude, longitude, accuracy, speed, heading, ts)
-       VALUES (?,?,?,?,?,?,NOW())`,
+       VALUES ($1,$2,$3,$4,$5,$6,NOW())`,
       [droneId, latitude, longitude, accuracy || null, speed || null, heading || null]
     );
-    await pool.execute(
-      `REPLACE INTO latest_locations (drone_id, latitude, longitude, accuracy, speed, heading, ts)
-       VALUES (?,?,?,?,?,?,NOW())`,
+    
+    // PostgreSQL Upsert (replaces MySQL REPLACE INTO)
+    await pool.query(
+      `INSERT INTO latest_locations (drone_id, latitude, longitude, accuracy, speed, heading, ts, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW())
+       ON CONFLICT (drone_id) 
+       DO UPDATE SET 
+         latitude = EXCLUDED.latitude, 
+         longitude = EXCLUDED.longitude,
+         accuracy = EXCLUDED.accuracy,
+         speed = EXCLUDED.speed,
+         heading = EXCLUDED.heading,
+         ts = EXCLUDED.ts,
+         updated_at = NOW()`,
       [droneId, latitude, longitude, accuracy || null, speed || null, heading || null]
     );
 
